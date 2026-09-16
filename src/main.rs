@@ -1220,8 +1220,11 @@ fn is_broken_pipe_io_error(error: &std::io::Error) -> bool {
 
 /// Decode RFC 4648 standard base64 into UTF-8 for `--encoded-command`.
 /// Padding is optional and ASCII whitespace is ignored, so callers can pass
-/// pre-wrapped payloads untouched.
+/// pre-wrapped payloads untouched. An optional `v1:` prefix is stripped: it
+/// marks the payload as version-1 so MSYS path conversion can never mangle a
+/// leading `/` when the command line travels through Git Bash.
 fn decode_base64_utf8(input: &str) -> anyhow::Result<String> {
+    let input = input.strip_prefix("v1:").unwrap_or(input);
     let bytes = decode_base64(input)?;
     String::from_utf8(bytes)
         .map_err(|_| anyhow::anyhow!("--encoded-command: payload is not valid UTF-8"))
@@ -1297,6 +1300,7 @@ mod tests {
     #[test]
     fn base64_decodes_padded_unpadded_and_wrapped_payloads() {
         assert_eq!(decode_base64_utf8("ZWNobyBoZWxsbw==").unwrap(), "echo hello");
+        assert_eq!(decode_base64_utf8("v1:ZWNobyBoZWxsbw==").unwrap(), "echo hello");
         assert_eq!(decode_base64_utf8("YWJj").unwrap(), "abc");
         assert_eq!(decode_base64_utf8("YQ==").unwrap(), "a");
         assert_eq!(decode_base64_utf8("YQ").unwrap(), "a");
