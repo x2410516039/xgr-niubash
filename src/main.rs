@@ -105,7 +105,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
     if first.starts_with('-')
         && !matches!(
             first.as_str(),
-            "-h" | "--help" | "-V" | "--version" | "-C" | "--repl-command"
+            "-h" | "--help" | "-V" | "--version" | "-C" | "--repl-command" | "--encoded-command"
         )
         && ShellInvocation::parse(&args[1..]).is_ok()
     {
@@ -137,7 +137,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             if args.len() < 3 {
                 anyhow::bail!("-c requires an argument");
             }
-            let mut shell = niubash_runtime::Shell::new()?;
+            let mut shell = niubash_runtime::Shell::new_one_shot()?;
             niubash_runtime::startup_trace::tick("-c: Shell::new");
             shell.executor.inherit_process_stdin();
             shell.enable_process_stdin_pipeline_bridge();
@@ -150,6 +150,25 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             niubash_runtime::startup_trace::tick("-c: execute_script");
             let code = shell.finish_with_exit_trap(code)?;
             niubash_runtime::startup_trace::tick("-c: exit trap");
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        "--encoded-command" => {
+            // Agent/CI channel: the payload arrives base64-encoded, so no
+            // shell quoting, heredoc, or `base64.exe` subprocess is involved.
+            if args.len() < 3 {
+                anyhow::bail!("--encoded-command requires an argument");
+            }
+            let command = decode_base64_utf8(&args[2])?;
+            let mut shell = niubash_runtime::Shell::new_one_shot()?;
+            shell.executor.inherit_process_stdin();
+            shell.enable_process_stdin_pipeline_bridge();
+            shell.source_non_interactive_env();
+            shell.executor.set_env("BASH_EXECUTION_STRING", &command);
+            let code = shell.execute_script(&command)?;
+            let code = shell.finish_with_exit_trap(code)?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -195,6 +214,10 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
 
     let mut shell = if invocation.read_stdin {
         niubash_runtime::Shell::new_for_stdin_script()?
+    } else if invocation.command.is_some() {
+        // Single-command non-interactive invocation: skip REPL-only
+        // initialization (prompt, history, completion, aliases).
+        niubash_runtime::Shell::new_one_shot()?
     } else {
         niubash_runtime::Shell::new()?
     };
@@ -571,6 +594,7 @@ fn print_usage() {
     println!("  -V, --version             Version and component info");
     println!("  -c <command>              Execute a command ad-hoc");
     println!("  -C, --repl-command <cmd>  Execute one non-interactive REPL command");
+    println!("      --encoded-command <b64>  Execute a base64-encoded command (no quoting)");
     println!();
     println!("  --install-wt-profile      Add/update the Windows Terminal profile");
     println!("      --set-default         Also set Niubash as the WT default profile");
@@ -1194,6 +1218,49 @@ fn is_broken_pipe_io_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::BrokenPipe || error.raw_os_error() == Some(232)
 }
 
+/// Decode RFC 4648 standard base64 into UTF-8 for `--encoded-command`.
+/// Padding is optional and ASCII whitespace is ignored, so callers can pass
+/// pre-wrapped payloads untouched.
+fn decode_base64_utf8(input: &str) -> anyhow::Result<String> {
+    let bytes = decode_base64(input)?;
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("--encoded-command: payload is not valid UTF-8"))
+}
+
+fn decode_base64(input: &str) -> anyhow::Result<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in input.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
+            continue;
+        }
+        let Some(value) = sextet(byte) else {
+            anyhow::bail!(
+                "--encoded-command: invalid base64 character {:?}",
+                byte as char
+            );
+        };
+        acc = (acc << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,5 +1292,25 @@ mod tests {
         assert!(normalize_plugin_bundle_release_tag("stable").is_err());
         assert!(normalize_plugin_bundle_release_tag("v1.2").is_err());
         assert!(normalize_plugin_bundle_release_tag("v1.2.3.4").is_err());
+    }
+
+    #[test]
+    fn base64_decodes_padded_unpadded_and_wrapped_payloads() {
+        assert_eq!(decode_base64_utf8("ZWNobyBoZWxsbw==").unwrap(), "echo hello");
+        assert_eq!(decode_base64_utf8("YWJj").unwrap(), "abc");
+        assert_eq!(decode_base64_utf8("YQ==").unwrap(), "a");
+        assert_eq!(decode_base64_utf8("YQ").unwrap(), "a");
+        assert_eq!(decode_base64_utf8("YWJ\nj").unwrap(), "abc");
+        assert_eq!(
+            decode_base64_utf8("Y3VybCAiaHR0cDovL2xvY2FsaG9zdC9hcGkiIHwganEgLm5hbWU=").unwrap(),
+            "curl \"http://localhost/api\" | jq .name"
+        );
+    }
+
+    #[test]
+    fn base64_rejects_invalid_payloads() {
+        assert!(decode_base64_utf8("!!!!").is_err());
+        // Valid base64 that decodes to invalid UTF-8.
+        assert!(decode_base64_utf8("//8=").is_err());
     }
 }

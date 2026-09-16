@@ -153,6 +153,10 @@ pub struct Shell {
     pub rc_file: Option<PathBuf>,
     // --noediting: disable readline-style line editing in the REPL.
     pub no_editing: bool,
+    // One-shot fast path (`Shell::new_one_shot`): the shell serves a single
+    // non-interactive command, so REPL-only state is never initialized and
+    // oh-my-niu framework hook probes are skipped entirely.
+    pub one_shot: bool,
 }
 
 pub struct StdinCurrentShellChild {
@@ -192,15 +196,27 @@ impl Shell {
         // `niu` is the sole public executable. Keep `$0` aligned with the
         // user-facing command; explicit script and `-c` names still override
         // this value at their call sites.
-        Self::new_with_script_name(Some("niu"))
+        Self::new_with_script_name(Some("niu"), false)
     }
 
     /// Construct a shell for scripts arriving on process stdin.
     pub fn new_for_stdin_script() -> anyhow::Result<Self> {
-        Self::new_with_script_name(None)
+        Self::new_with_script_name(None, false)
     }
 
-    fn new_with_script_name(script_name: Option<&str>) -> anyhow::Result<Self> {
+    /// Construct a minimal shell for non-interactive one-shot execution
+    /// (`niu -c`, `niu --encoded-command`, agent and CI harnesses).
+    ///
+    /// Skips everything only the interactive REPL reads — prompt/theme
+    /// backends, the history file, the completion directory scan, bundle
+    /// completion definitions, native widget bindings, and managed aliases.
+    /// Bash itself expands no aliases and records no history when
+    /// non-interactive, so the one-shot surface matches those semantics.
+    pub fn new_one_shot() -> anyhow::Result<Self> {
+        Self::new_with_script_name(Some("niu"), true)
+    }
+
+    fn new_with_script_name(script_name: Option<&str>, one_shot: bool) -> anyhow::Result<Self> {
         // 1. Load runtime defaults and environment-backed state.
         let mut config = load_config();
         config.history = config.history.with_env_overrides();
@@ -313,7 +329,10 @@ impl Shell {
         crate::startup_trace::tick("executor env + host handler");
 
         // 5. Apply managed aliases so explicit machine state remains
-        // authoritative when names collide.
+        // authoritative when names collide. One-shot shells keep them: the
+        // plugin_inventory contract pins bundle aliases (e.g. `gphase`) as
+        // visible to `niu -c`, and rubash exposes no direct alias setter, so
+        // there is no cheaper registration path today.
         let mut aliases = HashMap::new();
         for (name, value) in &config.aliases {
             if apply_alias(&mut executor, name, value) {
@@ -364,14 +383,23 @@ impl Shell {
             || config.shell.left_prompt_elements.is_some()
             || config.shell.right_prompt_elements.is_some();
         let plugin_prompt_sync = PluginPromptSyncConfig {
-            enabled: plugin_state.is_enabled("prompt-core") && !native_prompt_configured,
+            enabled: !one_shot
+                && plugin_state.is_enabled("prompt-core")
+                && !native_prompt_configured,
             indicators: config.shell.prompt_indicators.clone(),
             theme_name: config.theme_name.clone(),
             prompt_symbol: config.shell.prompt_symbol.clone(),
             git_prompt_symbols: git_prompt_symbols.clone(),
             git_prompt_format: template_git_prompt_format.clone(),
         };
-        let prompt: PromptBackend = if prompt_style == "segments" {
+        let prompt: PromptBackend = if one_shot {
+            // One-shot shells never render a prompt: use the cheapest backend
+            // instead of compiling the theme/template or segment engine.
+            PromptBackend::Bash(BashPrompt::new(
+                config.shell.prompt_symbol.clone(),
+                String::new(),
+            ))
+        } else if prompt_style == "segments" {
             let preset_name = config.shell.segment_preset.as_deref().unwrap_or("classic");
             let preset = SegmentPreset::from_name(preset_name).unwrap_or(SegmentPreset::Classic);
             let mut seg_config = SegmentPromptConfig::from_preset(
@@ -437,6 +465,10 @@ impl Shell {
             .path
             .clone()
             .unwrap_or_else(|| home_dir.join(".niubash_history"));
+        // The history provider stays in one-shot mode too: it costs well under
+        // a millisecond, and the `history`/`fc` builtins keep reading and
+        // writing the host history file even for `niu -c` (pinned by the
+        // host_contract tests).
         let history_provider = crate::history::RubashHistoryProvider::with_file(
             config.history.max_size,
             history_path.clone(),
@@ -453,18 +485,24 @@ impl Shell {
         crate::startup_trace::tick("history provider");
         let last_working_dir_cache_path = default_last_working_dir_cache_path(&home_dir);
 
-        // 8. Completion state.
+        // 8. Completion state. One-shot shells keep the (empty) shared state
+        // alive but skip the bundle definition parse and the completion
+        // directory scan: nothing reads them without a REPL.
         let mut initial_completion_state = CompletionState::new(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         );
         initial_completion_state.behavior = config.completion_behavior;
         let completion_state = Arc::new(Mutex::new(initial_completion_state));
-        let bundle_completion_defs = crate::plugins::plugin_completion_defs(&plugin_state);
+        let bundle_completion_defs = if one_shot {
+            Vec::new()
+        } else {
+            crate::plugins::plugin_completion_defs(&plugin_state)
+        };
 
         crate::startup_trace::tick("completion state");
 
         // 9. Load completion dirs from config (inline, not in thread).
-        {
+        if !one_shot {
             let mut s = completion_state.lock().unwrap();
             s.load_completion_dirs_with_bundle_and_definitions(
                 &config.completion_dirs,
@@ -474,15 +512,17 @@ impl Shell {
         }
 
         let mut native_widgets = config.native_widgets.clone();
-        if plugin_state.has_decision("keybindings") && !plugin_state.is_enabled("keybindings") {
+        if one_shot
+            || (plugin_state.has_decision("keybindings") && !plugin_state.is_enabled("keybindings"))
+        {
             native_widgets.enabled = false;
             native_widgets.presets.clear();
         }
         // Bundle-declared keybindings are gated by the `keybindings` pack
         // decision (the manifest control plane), not by the native-widget
         // feature flag: disabling the pack removes the bindings entirely.
-        let native_widget_bindings = if plugin_state.has_decision("keybindings")
-            && !plugin_state.is_enabled("keybindings")
+        let native_widget_bindings = if one_shot
+            || (plugin_state.has_decision("keybindings") && !plugin_state.is_enabled("keybindings"))
         {
             Vec::new()
         } else {
@@ -526,6 +566,7 @@ impl Shell {
             framework_hook_probes: HashMap::new(),
             rc_file: None,
             no_editing: false,
+            one_shot,
         };
         crate::startup_trace::tick("bundle completion + keybindings");
         shell.sync_executor_pwd_from_process_cwd();
@@ -1018,6 +1059,12 @@ impl Shell {
     /// shell. Probed once with the `declare -F` builtin and memoized per
     /// runner so repeated hook invocations stay free.
     fn framework_hook_defined(&mut self, runner: &str) -> bool {
+        // One-shot shells never source the user rc, so the framework entry
+        // points cannot exist here. Probing would make rubash fall through to
+        // a full PATH/command-link scan for a name that cannot exist.
+        if self.one_shot {
+            return false;
+        }
         if let Some(known) = self.framework_hook_probes.get(runner) {
             return *known;
         }
@@ -8206,6 +8253,7 @@ niubash_prompt_use_template "PLUGIN:{git}{prompt_char} " ""
             framework_hook_probes: HashMap::new(),
             rc_file: None,
             no_editing: false,
+            one_shot: false,
         };
         shell.sync_executor_pwd_from_process_cwd();
         shell
