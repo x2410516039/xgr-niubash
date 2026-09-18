@@ -18,7 +18,7 @@
 [![Stars](https://img.shields.io/github/stars/unixwin/niubash)](https://github.com/unixwin/niubash/stargazers)
 
 </div>
-
+基于原作者https://github.com/unixwin/niubash.git改造
 **niubash** is a native Windows shell that runs real Bash — no Linux VM, no
 emulation layer, no path roulette. One `niu.exe` bundles the
 [rubash](https://github.com/unixwin/rubash) language engine, real Unix
