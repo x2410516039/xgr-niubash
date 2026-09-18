@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Final A/B e2e comparison: 20 interleaved rounds each, report raw + stats.
-A=/d/project/git-clone/niubash-master-baseline/target/release/niu.exe
+A=/d/project/git-clone/niubash/perf/niu-master.exe
 B=/d/project/git-clone/niubash/perf/niu-fastpath.exe
 AV=(); BV=()
 "$A" -c true >/dev/null 2>&1; "$B" -c true >/dev/null 2>&1

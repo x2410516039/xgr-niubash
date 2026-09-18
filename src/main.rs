@@ -28,7 +28,7 @@
 //!   self-update / update-niubash → REPL commands for Niubash self-update
 
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rubash::invocation::ShellInvocation;
@@ -82,7 +82,19 @@ fn run_main() -> ExitCode {
         run_internal_pipeline_utility(name, &args[2..]);
     }
 
-    if let Err(e) = run(&args) {
+    let (cwd_state, args) = match extract_cwd_state_options(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("niu: {}", error);
+            return ExitCode::from(1);
+        }
+    };
+    // Restore before anything else runs: niu's own startup, a relative script
+    // path, and `source_non_interactive_env` must all see the directory the
+    // caller last left behind.
+    restore_cwd_state(&cwd_state);
+
+    if let Err(e) = run(&args, &cwd_state) {
         if is_broken_pipe_error(&e) {
             return ExitCode::from(1);
         }
@@ -92,12 +104,12 @@ fn run_main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run(args: &[String]) -> anyhow::Result<()> {
+fn run(args: &[String], cwd_state: &CwdStateOption) -> anyhow::Result<()> {
     if args.len() < 2 {
         return if niubash_runtime::terminal::stdio_is_interactive() {
             run_repl()
         } else {
-            run_stdin_script()
+            run_stdin_script(cwd_state)
         };
     }
 
@@ -109,7 +121,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         )
         && ShellInvocation::parse(&args[1..]).is_ok()
     {
-        return run_shell_invocation(&args[1..]);
+        return run_shell_invocation(&args[1..], cwd_state);
     }
     match first.as_str() {
         "-h" | "--help" => {
@@ -150,10 +162,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             niubash_runtime::startup_trace::tick("-c: execute_script");
             let code = shell.finish_with_exit_trap(code)?;
             niubash_runtime::startup_trace::tick("-c: exit trap");
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
+            finish_one_shot(cwd_state, &shell, code)
         }
         "--encoded-command" => {
             // Agent/CI channel: the payload arrives base64-encoded, so no
@@ -169,10 +178,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             shell.executor.set_env("BASH_EXECUTION_STRING", &command);
             let code = shell.execute_script(&command)?;
             let code = shell.finish_with_exit_trap(code)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
+            finish_one_shot(cwd_state, &shell, code)
         }
         _ => {
             // Treat as a script file to execute
@@ -189,15 +195,12 @@ fn run(args: &[String]) -> anyhow::Result<()> {
             let content = std::fs::read_to_string(&script)?;
             let code = shell.execute_script(&content)?;
             let code = shell.finish_with_exit_trap(code)?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(())
+            finish_one_shot(cwd_state, &shell, code)
         }
     }
 }
 
-fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
+fn run_shell_invocation(args: &[String], cwd_state: &CwdStateOption) -> anyhow::Result<()> {
     let invocation =
         ShellInvocation::parse(args).map_err(|error| anyhow::anyhow!("niu: {}", error))?;
 
@@ -240,10 +243,7 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
         niubash_runtime::startup_trace::tick("invocation: execute_script");
         let code = shell.finish_with_exit_trap(code)?;
         niubash_runtime::startup_trace::tick("invocation: exit trap");
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
+        return finish_one_shot(cwd_state, &shell, code);
     }
     if let Some(script_name) = invocation.script {
         shell.source_non_interactive_env();
@@ -251,10 +251,7 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
         let content = std::fs::read_to_string(script_arg_to_host_path(&script_name))?;
         let code = shell.execute_script(&content)?;
         let code = shell.finish_with_exit_trap(code)?;
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
+        return finish_one_shot(cwd_state, &shell, code);
     }
     // Bash -i forces an interactive shell even when stdin is not a terminal;
     // with no command or script, a terminal (or -i) means the REPL.
@@ -267,10 +264,7 @@ fn run_shell_invocation(args: &[String]) -> anyhow::Result<()> {
     std::io::stdin().read_to_string(&mut content)?;
     let code = shell.execute_script(&content)?;
     let code = shell.finish_with_exit_trap(code)?;
-    if code != 0 {
-        std::process::exit(code);
-    }
-    Ok(())
+    finish_one_shot(cwd_state, &shell, code)
 }
 
 fn invocation_input(invocation: &ShellInvocation) -> anyhow::Result<String> {
@@ -413,7 +407,7 @@ fn run_repl_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_stdin_script() -> anyhow::Result<()> {
+fn run_stdin_script(cwd_state: &CwdStateOption) -> anyhow::Result<()> {
     let mut shell = niubash_runtime::Shell::new_for_stdin_script()?;
     shell.executor.inherit_process_stdin();
     shell.source_non_interactive_env();
@@ -427,9 +421,7 @@ fn run_stdin_script() -> anyhow::Result<()> {
                 if !pending.is_empty() {
                     let code = shell.execute_script(&pending.join("\n"))?;
                     let code = shell.finish_with_exit_trap(code)?;
-                    if code != 0 {
-                        std::process::exit(code);
-                    }
+                    finish_one_shot(cwd_state, &shell, code)?;
                 }
                 break;
             }
@@ -456,12 +448,224 @@ fn run_stdin_script() -> anyhow::Result<()> {
         };
         if code != 0 {
             let code = shell.finish_with_exit_trap(code)?;
-            std::process::exit(code);
+            finish_one_shot(cwd_state, &shell, code)?;
         }
         pending.clear();
     }
 
     let code = shell.finish_with_exit_trap(0)?;
+    finish_one_shot(cwd_state, &shell, code)
+}
+
+/// `--cwd-state <file>` / `--cwd-state-verbose`: the directory memory an
+/// agent host uses to make one-shot invocations behave like one shell.
+///
+/// The option is deliberately explicit rather than a default: `niu -c` without
+/// it keeps the inherited working directory byte-for-byte, because CI drivers
+/// and interactive callers rely on the start directory being predictable. The
+/// state file is a small JSON object (`{"cwd": "...", "updatedAt": <unix ms>}`)
+/// so a host can read, display, or reset it with ordinary tooling.
+#[derive(Default)]
+struct CwdStateOption {
+    /// State file to restore from and record into.
+    path: Option<PathBuf>,
+    /// Report restore/record lines on stderr for debugging the contract.
+    verbose: bool,
+}
+
+/// Split the cwd-state options off the front of argv.
+///
+/// The options form a *prefix* group: the scan stops at the first token that is
+/// not one of them, so the positional parameters of `niu -c <cmd> <name> ...`
+/// can never be mistaken for an option, and `run`'s bash-style
+/// `ShellInvocation` parser never sees the flags at all.
+fn extract_cwd_state_options(args: &[String]) -> anyhow::Result<(CwdStateOption, Vec<String>)> {
+    let mut options = CwdStateOption::default();
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    if let Some(program) = args.first() {
+        rest.push(program.clone());
+    }
+
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "--cwd-state" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("--cwd-state requires a file path argument"))?;
+                options.path = Some(resolve_state_path(value));
+                index += 2;
+            }
+            "--cwd-state-verbose" => {
+                options.verbose = true;
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    rest.extend_from_slice(&args[index..]);
+    Ok((options, rest))
+}
+
+/// Pin the state path to the directory niu was started in.
+///
+/// A relative path has to keep naming the same file for both halves of the
+/// contract: the record is written after the command ran, and `execute_script`
+/// has already moved the process into the shell's final directory by then, so
+/// resolving late would record into a different file than the one restored from.
+fn resolve_state_path(value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path,
+    }
+}
+
+/// Move into the directory a previous invocation recorded.
+///
+/// Every failure is silent by design: a missing, unreadable, or stale state
+/// file must never turn into a command failure. The inherited working
+/// directory is the documented fallback, and the next record replaces the
+/// stale value, so the state heals itself without a cleanup step.
+fn restore_cwd_state(options: &CwdStateOption) {
+    let Some(state) = options.path.as_deref() else {
+        return;
+    };
+    let Some(directory) = read_cwd_state(state) else {
+        return;
+    };
+    match std::env::set_current_dir(&directory) {
+        Ok(()) => {
+            if options.verbose {
+                eprintln!("niu: cwd-state: restored {}", directory.display());
+            }
+        }
+        Err(error) => {
+            if options.verbose {
+                eprintln!(
+                    "niu: cwd-state: cannot enter {}: {}",
+                    directory.display(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+/// Read the recorded directory: the JSON object this module writes, or a bare
+/// path so a hand-written `echo D:/work > state` file also works. Only an
+/// existing directory is returned, which is what keeps a deleted or
+/// never-created directory from becoming a start-directory failure.
+fn read_cwd_state(state: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(state).ok()?;
+    let content = content.trim().trim_start_matches('\u{feff}');
+    if content.is_empty() {
+        return None;
+    }
+    let recorded = if content.starts_with('{') {
+        serde_json::from_str::<serde_json::Value>(content)
+            .ok()?
+            .get("cwd")?
+            .as_str()?
+            .to_string()
+    } else {
+        content.trim_matches('"').to_string()
+    };
+    let directory = PathBuf::from(recorded.trim());
+    directory.is_dir().then_some(directory)
+}
+
+/// Record where the shell ended so the next invocation resumes there.
+///
+/// Runs after `finish_with_exit_trap` (so a directory an `EXIT` trap changed
+/// into is kept) and before the exit code is propagated (so a failing command
+/// still records — a `&&`-style record would lose the directory on the first
+/// failure). A write failure is reported but never changes the exit code: the
+/// command itself succeeded.
+fn record_cwd_state(options: &CwdStateOption, shell: &niubash_runtime::Shell) {
+    let Some(state) = options.path.as_deref() else {
+        return;
+    };
+    let Some(directory) = shell.current_host_cwd() else {
+        return;
+    };
+
+    let payload = serde_json::json!({
+        "cwd": directory.to_string_lossy(),
+        "updatedAt": unix_millis(),
+    });
+    match write_cwd_state(state, payload.to_string().as_bytes()) {
+        Ok(()) => {
+            if options.verbose {
+                eprintln!("niu: cwd-state: recorded {}", directory.display());
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "niu: cwd-state: cannot write {}: {}",
+                state.display(),
+                error
+            );
+        }
+    }
+}
+
+/// Write the state file through a temporary sibling, so a reader (another
+/// invocation of the same host) never observes a half-written file.
+fn write_cwd_state(state: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = state
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let temp = temp_state_path(state);
+    std::fs::write(&temp, bytes)?;
+    for attempt in 0..3 {
+        match std::fs::rename(&temp, state) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 2 => {
+                let _ = std::fs::remove_file(&temp);
+                // Last resort: on Windows a scanner or an open handle can keep
+                // the destination busy. A direct write still records the
+                // directory; only atomicity is lost.
+                return std::fs::write(state, bytes).map_err(|_| error);
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    unreachable!("the retry loop returns on its last attempt")
+}
+
+/// `<name>.<pid>.tmp` beside the state file: two invocations of the same host
+/// never share a temporary path.
+fn temp_state_path(state: &Path) -> PathBuf {
+    let mut name = state.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    state.with_file_name(name)
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
+/// Close out a one-shot invocation: record the directory state, then keep the
+/// shell's exit-code contract unchanged.
+fn finish_one_shot(
+    options: &CwdStateOption,
+    shell: &niubash_runtime::Shell,
+    code: i32,
+) -> anyhow::Result<()> {
+    record_cwd_state(options, shell);
     if code != 0 {
         std::process::exit(code);
     }
@@ -595,6 +799,9 @@ fn print_usage() {
     println!("  -c <command>              Execute a command ad-hoc");
     println!("  -C, --repl-command <cmd>  Execute one non-interactive REPL command");
     println!("      --encoded-command <b64>  Execute a base64-encoded command (no quoting)");
+    println!("      --cwd-state <file>    Resume the directory recorded in <file>, then record");
+    println!("                            this run's final directory back into it (agent hosts)");
+    println!("      --cwd-state-verbose   Report cwd-state restores/records on stderr");
     println!();
     println!("  --install-wt-profile      Add/update the Windows Terminal profile");
     println!("      --set-default         Also set Niubash as the WT default profile");
@@ -1299,8 +1506,14 @@ mod tests {
 
     #[test]
     fn base64_decodes_padded_unpadded_and_wrapped_payloads() {
-        assert_eq!(decode_base64_utf8("ZWNobyBoZWxsbw==").unwrap(), "echo hello");
-        assert_eq!(decode_base64_utf8("v1:ZWNobyBoZWxsbw==").unwrap(), "echo hello");
+        assert_eq!(
+            decode_base64_utf8("ZWNobyBoZWxsbw==").unwrap(),
+            "echo hello"
+        );
+        assert_eq!(
+            decode_base64_utf8("v1:ZWNobyBoZWxsbw==").unwrap(),
+            "echo hello"
+        );
         assert_eq!(decode_base64_utf8("YWJj").unwrap(), "abc");
         assert_eq!(decode_base64_utf8("YQ==").unwrap(), "a");
         assert_eq!(decode_base64_utf8("YQ").unwrap(), "a");

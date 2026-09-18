@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-stage startup trace comparison: run NIU_TRACE_STARTUP N times per binary,
 # take the per-stage minimum (least load-contaminated).
-A=/d/project/git-clone/niubash-master-baseline/target/release/niu.exe
+A=/d/project/git-clone/niubash/perf/niu-master.exe
 B=/d/project/git-clone/niubash/perf/niu-fastpath.exe
 C=/c/Users/xianguanrong/AppData/Local/Programs/Niubash/niu.exe
 

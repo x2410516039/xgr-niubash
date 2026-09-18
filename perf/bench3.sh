@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Three-way interleaved benchmark: A=master-build B=fastpath-build C=installed
-A=/d/project/git-clone/niubash-master-baseline/target/release/niu.exe
+A=/d/project/git-clone/niubash/perf/niu-master.exe
 B=/d/project/git-clone/niubash/perf/niu-fastpath.exe
 C=/c/Users/xianguanrong/AppData/Local/Programs/Niubash/niu.exe
 

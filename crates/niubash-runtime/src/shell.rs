@@ -2575,6 +2575,19 @@ impl Shell {
         host_path.is_dir().then_some(host_path)
     }
 
+    /// Host path of the directory this shell is currently in.
+    ///
+    /// `PWD` wins over the process working directory: it is what the shell
+    /// itself reports, so an `EXIT` trap's `cd` is included even though
+    /// `execute_script` syncs the process cwd before that trap runs. The
+    /// process cwd is the fallback for a shell whose `PWD` is unset or points
+    /// at a directory that no longer exists, so callers that persist the
+    /// directory (the host `--cwd-state` file) always get a value.
+    pub fn current_host_cwd(&self) -> Option<PathBuf> {
+        self.executor_pwd_host_path()
+            .or_else(|| std::env::current_dir().ok())
+    }
+
     fn sync_executor_pwd_from_process_cwd(&mut self) {
         let Ok(cwd) = std::env::current_dir() else {
             return;
