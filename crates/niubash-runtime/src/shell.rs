@@ -459,28 +459,24 @@ impl Shell {
         normalize_executor_home_env(&mut executor, &home_dir);
         ensure_windows_profile_env(&mut executor, &home_dir);
         ensure_prompt_terminal_env(&mut executor);
+        crate::startup_trace::tick("host env defaults");
         set_default_niubash_framework_env(&mut executor, &home_dir);
+        crate::startup_trace::tick("framework env");
         let history_path = config
             .history
             .path
             .clone()
             .unwrap_or_else(|| home_dir.join(".niubash_history"));
-        // The history provider stays in one-shot mode too: it costs well under
-        // a millisecond, and the `history`/`fc` builtins keep reading and
-        // writing the host history file even for `niu -c` (pinned by the
-        // host_contract tests).
+        // The history provider stays in one-shot mode too: the `history`/`fc`
+        // builtins keep reading and writing the host history file even for
+        // `niu -c` (pinned by the host_contract tests). The provider defers
+        // opening the file until one of those builtins runs, so a one-shot
+        // command that never touches history pays no history I/O at startup.
         let history_provider = crate::history::RubashHistoryProvider::with_file(
             config.history.max_size,
             history_path.clone(),
             config.history.mode,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to open history provider {}: {}",
-                history_path.display(),
-                error
-            )
-        })?;
+        );
         executor.set_history_provider(Rc::new(RefCell::new(history_provider)));
         crate::startup_trace::tick("history provider");
         let last_working_dir_cache_path = default_last_working_dir_cache_path(&home_dir);
@@ -4888,10 +4884,17 @@ fn set_default_niubash_framework_env(executor: &mut Executor, home_dir: &Path) {
 
 fn app_bundled_niubash_framework_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let parent = exe.parent()?;
+    let bundles = exe.parent()?.join("bundles");
+    // One stat for the shared bundles directory: without it neither bundle
+    // name can exist. Repo builds and agent/CI installs have no side-car
+    // bundle, and this shortcut keeps their every-shot probe at a single
+    // miss instead of three per candidate.
+    if !bundles.is_dir() {
+        return None;
+    }
     [OFFICIAL_BUNDLE_NAME, OFFICIAL_BUNDLE_LEGACY_NAMES[0]]
         .iter()
-        .map(|name| parent.join("bundles").join(name))
+        .map(|name| bundles.join(name))
         .find(|path| is_niubash_framework_dir(path))
 }
 
@@ -4907,16 +4910,18 @@ fn first_valid_niubash_framework_dir(
         home_dir.join(".oh-my-winuxsh"),
         home_dir.join(".niubash").join("oh-my-winuxsh"),
     ];
-    for name in [OFFICIAL_BUNDLE_NAME, OFFICIAL_BUNDLE_LEGACY_NAMES[0]] {
-        let version_root = home_dir.join(".niubash").join("bundles").join(name);
-        if let Ok(entries) = std::fs::read_dir(&version_root) {
-            let mut versions = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-                .collect::<Vec<_>>();
-            versions.sort();
-            candidates.extend(versions);
+    let version_roots = home_dir.join(".niubash").join("bundles");
+    if version_roots.is_dir() {
+        for name in [OFFICIAL_BUNDLE_NAME, OFFICIAL_BUNDLE_LEGACY_NAMES[0]] {
+            if let Ok(entries) = std::fs::read_dir(version_roots.join(name)) {
+                let mut versions = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect::<Vec<_>>();
+                versions.sort();
+                candidates.extend(versions);
+            }
         }
     }
     if let Some(path) = app_bundle {
@@ -4933,6 +4938,12 @@ fn framework_dir_has_new_entry(path: &Path) -> bool {
 }
 
 fn is_niubash_framework_dir(path: &Path) -> bool {
+    // The directory check comes first: it rejects a miss with one stat
+    // instead of three. Machines without any bundle (agent/CI hosts, repo
+    // builds) hit this path for every candidate on every one-shot startup.
+    if !path.is_dir() {
+        return false;
+    }
     framework_dir_has_new_entry(path) || path.join("oh-my-winuxsh.winux").is_file()
 }
 

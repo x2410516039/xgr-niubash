@@ -5,29 +5,63 @@
 
 ## 0. 基线与预算
 
-当前 `niu -c "echo hello"` 端到端 ~81ms（安静时机），构成：
+`niu -c "echo hello"` 端到端（安静时机），2024-09 本机复测：
 
 ```
 ~50ms  进程创建 + Rust runtime + main() 前置检查      ← 硬地板，进程内无法突破
   ~1ms  winuxcmd 选择 + shell root
- ~7-9ms Executor::new                                  ← 进程内最大单项
- ~1.9ms env + host handler + aliases + packs
- ~0.7ms history provider（含历史文件打开 I/O）
- ~0.1ms completion state + bundle keybindings（one-shot 已归零）
- ~0.9ms execute_script（echo hello 本体）
- ~0.4ms exit trap（one-shot 已短路探测）
+ ~7-9ms Executor::new                                  ← 进程内最大单项（rubash 内部）
+  ~1.9ms env + host handler + aliases + packs
+  ~0.6ms history provider → ✅ §1 懒加载后 ~0.05ms
+  ~0.5ms framework env 探测 → ✅ §3a 削减后 ~0.15ms
+  ~0.1ms completion state + bundle keybindings（one-shot 已归零）
+  ~0.9ms execute_script（echo hello 本体）
+  ~0.4ms exit trap（one-shot 已短路探测）
 ```
 
-**结论**：进程内还剩 ~12ms 可挖（收益上限：81ms → ~50ms 地板）。
-要突破地板只有一条路——**常驻进程**（第 4 节），那才能到 ~10-20ms。
+**结论**：§1 + §3a 合计再砍 ~1ms（进程内 ~12ms → ~11ms）；同窗口交错 e2e 对拍中
+低于 ±5ms 调度抖动，只能靠 trace 段数据归因。进程内剩余大头是 `Executor::new`
+（rubash 上游）与别名注册（§2 上游 setter）。要突破进程创建地板只有一条路——
+**常驻进程**（第 4 节），那才能到 ~10-20ms。
+对拍原生 Git Bash（`perf/bench-vs-bash.sh`）：本机 `niu -c` 全命令面已快于
+Git Bash 5.3（`true` 22 vs 50ms、`echo|grep -c` 43 vs 93ms，同窗口 min）。
 
-## 1. 历史文件懒加载（低成本，~0.7ms）
+## 1. 历史文件懒加载（✅ 已完成，~0.6ms）
 
-`RubashHistoryProvider::with_file` 在启动时打开历史文件。改为首次调用
-`history`/`fc` 相关 builtin 时才打开（`Option<Provider>` + 按需初始化）。
+`RubashHistoryProvider::with_file` 原本在启动时打开历史文件。现在只记录参数，
+首次被 `history`/`fc` 相关 builtin 触达时才真正打开（`Option<LiveFileBackedHistory>`
++ `opened()` 按需初始化）；构造不再可能失败，坏历史文件从"启动失败"降级为
+"builtin 报错"，对一次性命令更友好。REPL 的 `LiveFileBackedHistory`（repl.rs）
+不受影响，仍是交互侧的 history 拥有者。
 
-- 契约：`host_contract.rs` 的 history/fc 语义不变（只是延迟打开）。
-- 风险：低。验收：host_contract 全绿 + 启动 trace 中 history provider 段 <0.1ms。
+- 实测：启动 trace history provider 段 0.6-0.75ms → **0.03-0.07ms**。
+- 契约：host_contract 的 history/fc 用例全绿（只是延迟打开）。
+- 注意：该段 tick 之间还夹着 host env 默认值写入，故新增了 `host env defaults`
+  / `framework env` 两个细分 tick（见 §3a）。
+
+## 3a. 框架目录探测削减（✅ 已完成，~0.5ms）
+
+`set_default_niubash_framework_env`（trace `framework env` 段）原本在无 bundle
+机器上走最坏路径：exe 侧 2 候选 × 3 次 `is_file` stat + home 侧 4 候选 × 3 stat
++ 2 次 `read_dir` ≈ 18 次系统调用，实测 0.29-0.9ms。三处结构性削减：
+
+- `app_bundled_niubash_framework_dir`：先用 1 次 stat 判 `<exe_dir>/bundles`
+  目录，不存在直接返回（1 次 miss 代替 6 次）；
+- `first_valid_niubash_framework_dir`：`~/.niubash/bundles` 根目录一次 stat
+  通过后才执行 2 次 `read_dir` 版本枚举；
+- `is_niubash_framework_dir`：`is_dir` 前置，单次 stat 否决代替 3 次 `is_file`。
+
+- 实测：`framework env` 段 0.29-0.9ms → **0.13-0.27ms**（无 bundle 机器）。
+- 契约：有 bundle 的机器探测结果与原逻辑逐字节一致（只是减少否定路径的
+  stat 次数）；`plugin_inventory` 别名契约（bundle 清单优先）仍绿。
+- 残余：4 次 home 候选 stat；可再做磁盘负缓存（记录"本机无 bundle"），
+  预期再省 ~0.15ms，状态文件失效语义复杂度不划算，暂缓。
+
+## 3b. 静态 CRT（实测不采纳）
+
+`RUSTFLAGS="-C target-feature=+crt-static"` 全量重建后 100 轮交错 `niu -c true`：
+min 17.2 vs 20.1ms（略优）、avg 37.3 vs 36.2ms（略差）——信号混杂无法归因，
+且二进制 +1.1MB、偏离默认配置。不采纳；机器安静窗口可复测。
 
 ## 2. `Executor::set_alias`（上游 PR，~1.3ms）
 
@@ -97,7 +131,9 @@ DSH 的 Bash 工具直接以 `niu.exe` 为 shell：省掉 ZCode hook 改写段�
 
 | # | 项目 | 预期收益 | 成本 | 建议 |
 |---|---|---|---|---|
-| 1 | history 懒加载 | ~0.7ms | 半天 | 做 |
+| 1 | history 懒加载 | ~0.6ms | ✅ 已完成 | — |
+| 3a | 框架探测削减 | ~0.5ms | ✅ 已完成 | — |
+| 3b | 静态 CRT | 0（信号混杂） | 已实测 | 不采纳 |
 | 2 | `Executor::set_alias` 上游 PR | ~1.3ms + 解锁 one-shot 砍别名 | 1-2 天跨仓库 | 做 |
 | 3 | `Executor::new` 剖析 | 0~7ms（未知） | 1-3 天 | 先 profile 再定 |
 | 4 | DSH 直连 | -100ms（宿主侧） | DSH 侧小改 | 做 |

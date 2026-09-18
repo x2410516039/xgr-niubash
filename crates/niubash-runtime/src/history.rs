@@ -67,7 +67,12 @@ fn ensure_history_file_accessible(path: &std::path::Path) {
 
 /// Adapter exposing the host Reedline history to Rubash builtins.
 pub(crate) struct RubashHistoryProvider {
-    inner: LiveFileBackedHistory,
+    capacity: usize,
+    path: PathBuf,
+    mode: HistoryMode,
+    /// Deferred open state: the file is only opened the first time a
+    /// history builtin actually touches the provider.
+    inner: Option<LiveFileBackedHistory>,
 }
 
 impl std::fmt::Debug for RubashHistoryProvider {
@@ -78,17 +83,40 @@ impl std::fmt::Debug for RubashHistoryProvider {
 }
 
 impl RubashHistoryProvider {
-    pub(crate) fn with_file(capacity: usize, path: PathBuf, mode: HistoryMode) -> Result<Self> {
-        Ok(Self {
-            inner: LiveFileBackedHistory::with_mode(capacity, path, mode)?,
-        })
+    /// Record the history file parameters without touching the filesystem.
+    ///
+    /// The host shell wires this provider into every one-shot invocation
+    /// (`niu -c`, scripts), where most commands never run a history builtin.
+    /// Opening eagerly cost ~0.6-0.8 ms of startup I/O per invocation, so the
+    /// actual open is deferred to [`Self::opened`]; construction cannot fail.
+    pub(crate) fn with_file(capacity: usize, path: PathBuf, mode: HistoryMode) -> Self {
+        Self {
+            capacity,
+            path,
+            mode,
+            inner: None,
+        }
+    }
+
+    /// Open the history file on first use.
+    ///
+    /// A failed open surfaces here (inside the builtin that asked for
+    /// history) instead of at shell construction: a broken history file must
+    /// not stop a one-shot command that does not care about history.
+    fn opened(&mut self) -> io::Result<&mut LiveFileBackedHistory> {
+        if self.inner.is_none() {
+            let inner = LiveFileBackedHistory::with_mode(self.capacity, self.path.clone(), self.mode)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.inner = Some(inner);
+        }
+        Ok(self.inner.as_mut().expect("provider opened above"))
     }
 }
 
 impl rubash::history::HistoryProvider for RubashHistoryProvider {
     fn entries(&mut self) -> io::Result<Vec<String>> {
         let items = self
-            .inner
+            .opened()?
             .search(SearchQuery::all_that_contain_rev(String::new()))
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(items
@@ -99,13 +127,13 @@ impl rubash::history::HistoryProvider for RubashHistoryProvider {
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.inner
+        self.opened()?
             .clear()
             .map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn append(&mut self, command: String) -> io::Result<()> {
-        self.inner
+        self.opened()?
             .save(HistoryItem::from_command_line(command))
             .map(|_| ())
             .map_err(|error| io::Error::other(error.to_string()))
