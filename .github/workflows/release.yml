@@ -47,7 +47,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout rubash path dependency
+      - name: Checkout rubash git dependency
         run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
 
       - name: Checkout oh-my-niu bundle
@@ -106,25 +106,19 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.rust_target }}
 
-      # rubash is a path dependency, so `cargo update -p rubash` cannot pin it:
-      # there is no registry entry to update, and the step silently did nothing.
-      # The revision the binary actually contains is resolved here and embedded
-      # at build time by build.rs, so `niu --version` reports it.
+      # rubash is a git dependency pinned by Cargo.lock; build.rs embeds the
+      # pinned revision into the binary. Resolve the same value here so the
+      # release notes and the `niu --version` banner can never disagree.
       - name: Pin rubash revision
         id: rubash
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath ..\rubash)) {
-            throw "rubash checkout missing at ..\rubash"
+          $lock = Get-Content -LiteralPath Cargo.lock -Raw
+          if ($lock -notmatch '(?s)name = "rubash"\s*\nversion = "[^"]+"\s*\nsource = "git\+[^"]+#([0-9a-f]+)"') {
+            throw "could not resolve the rubash pin from Cargo.lock"
           }
-          $revision = (git -C ..\rubash rev-parse --short=12 HEAD).Trim()
-          if ([string]::IsNullOrWhiteSpace($revision)) {
-            throw "could not resolve rubash revision"
-          }
-          $dirty = git -C ..\rubash status --porcelain
-          if (-not [string]::IsNullOrWhiteSpace($dirty)) {
-            throw "rubash checkout is dirty; a release must pin a committed revision`n$dirty"
-          }
+          $full = $Matches[1]
+          $revision = $full.Substring(0, [Math]::Min(12, $full.Length))
           Write-Host "rubash revision: $revision"
           "revision=$revision" >> $env:GITHUB_OUTPUT
 

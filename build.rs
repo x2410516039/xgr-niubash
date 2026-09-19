@@ -9,8 +9,8 @@ fn main() {
     embed_windows_icon();
 }
 
-/// Locate the `rubash` checkout that `Cargo.toml` pulls in as a path
-/// dependency.
+/// Locate the `rubash` checkout that CI clones next to this repository, used
+/// only as a fallback and for the `-dirty` marker.
 fn rubash_checkout_dir() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
     let sibling = manifest_dir.parent()?.join("rubash");
@@ -19,16 +19,16 @@ fn rubash_checkout_dir() -> Option<PathBuf> {
 
 /// Embed the rubash revision that is actually compiled into this binary.
 ///
-/// `rubash` is a path dependency, so `Cargo.lock` carries no `source =` line
-/// for it and the old lookup always fell through to the literal string
-/// "master" — every niubash build printed the same revision no matter which
-/// rubash commit was linked, and a release could not be traced back to its
-/// engine.
+/// `rubash` is a git dependency pinned by `Cargo.lock`, so the lock carries
+/// the revision that `cargo build --locked` compiles — that is the
+/// authoritative answer. The sibling CI checkout is only a fallback (and the
+/// source of the `-dirty` marker); preferring it would let a fresh clone of
+/// master disagree with the engine that actually got linked.
 fn emit_rubash_revision() {
     println!("cargo:rerun-if-changed=Cargo.lock");
 
-    let revision = rubash_revision_from_checkout()
-        .or_else(rubash_revision_from_lock)
+    let revision = rubash_revision_from_lock()
+        .or_else(rubash_revision_from_checkout)
         .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=NIU_RUBASH_REV={revision}");
@@ -109,9 +109,9 @@ fn git_common_dir(dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// `git = "..."` dependencies record their revision in `Cargo.lock`; a path
-/// dependency does not. Kept so the value stays correct if rubash ever moves
-/// back to a git dependency.
+/// The lock records the pinned git revision as a full 40-char SHA in the
+/// `source` line; the banner shows the same 12-char prefix a checkout
+/// reports. Kept as the authoritative source since the git-dependency switch.
 fn rubash_revision_from_lock() -> Option<String> {
     let lock = fs::read_to_string("Cargo.lock").ok()?;
     let mut in_rubash = false;
@@ -132,8 +132,7 @@ fn rubash_revision_from_lock() -> Option<String> {
             let source = trimmed.trim_start_matches("source = ").trim_matches('"');
             return source
                 .rsplit_once('#')
-                .map(|(_, rev)| rev.to_string())
-                .or_else(|| Some("unknown".to_string()));
+                .map(|(_, rev)| rev.chars().take(12).collect());
         }
     }
 

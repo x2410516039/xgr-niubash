@@ -2,6 +2,60 @@
 
 All notable changes to Niubash are documented in this file.
 
+## [Unreleased]
+
+### Features
+
+- **One-shot fast path** for `-c` / `--encoded-command`: skip REPL-only
+  initialization on the non-interactive hot path (`890f3b1`)
+- **`--encoded-command` v1: prefix**: optional marker so MSYS path conversion
+  can never mangle a leading `/` when the command line travels through Git
+  Bash (`deb7211`)
+- **`--cwd-state <file>`**: directory memory for one-shot agent invocations —
+  restore the recorded directory before the command and record the final
+  directory after it; atomic temp-file write with retry
+  (`5c4ec1d`, docs/cwd-state.md)
+- **`--cwd-state-verbose`**: report restore/record lines on stderr for
+  debugging the contract
+
+### Performance
+
+- **Lazy history open**: `niu -c` no longer opens the history file at startup;
+  the open is deferred to the first `history`/`fc` builtin touch
+  (~0.6-0.8 ms saved per one-shot invocation) (`833cc7a`)
+- **Framework probe trim**: fewer negative-path stats when resolving the
+  oh-my-niu bundle directory (~0.5 ms on bundle-less machines) (`833cc7a`)
+
+## [1.1.2] - 2026-09-15
+
+### Fixes
+
+- **Piped stdin scripts**: decode script source on char boundaries so
+  multibyte UTF-8 survives a byte-at-a-time pipe read (#98, `28033c9`)
+- **`--dump-strings`**: keep a trailing backslash in unterminated `$"…"`
+  literals, matching GNU bash (`8c3d750`)
+
+### Dependencies
+
+- **rubash 1.2.0** pinned from git master `b4cbcadc`; the crate now tracks
+  rubash git master instead of the crates.io 1.1.0 release (`daacb8b`,
+  `c5bb3a6`)
+
+## [1.1.1] - 2026-09-14
+
+### Features
+
+- **Startup banner** trimmed to a single version line (`676a680`)
+- **Self-update diagnostics**: surface WinHTTP error causes and the download
+  URLs that failed (`a6e0d1a`)
+
+### Fixes
+
+- **Setup wizard**: ignore key-release events and force-enable VT output on
+  startup so Windows 10 conhost renders the wizard correctly (`6f56136`)
+- **Read-only install roots**: keep `/tmp` writable and warn once instead of
+  failing startup (#94, `27f4b47`)
+
 ## [1.1.0] - 2026-09-12
 
 ### Highlights

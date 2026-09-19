@@ -28,7 +28,7 @@
 - Preserve quiet, deterministic non-interactive behavior for direct Niubash project commands, `niu -c`, and script execution: no banners, stable stdout/stderr, exact exit-code propagation.
 - Keep interactive UX features in niubash/reedline unless they require shell semantics; shell semantics move to rubash.
 - Keep compatibility tests honest: `tests/compat.rs` requires winuxcmd command links in the Windows process `PATH`, not just a bare `winuxcmd.exe`. When prepending a local WinuxCmd build for `cargo test`, use the Windows separator (`;`), for example `PATH="C:/path/to/WinuxCmd/build-vs-release;$PATH"`.
-- Keep one authoritative dependency lock at the repository root. Do not let `crates/niubash-runtime/Cargo.lock` drift from the binary build.
+- Keep one authoritative dependency lock at the repository root. `niubash-runtime` is a workspace member: it has no own `Cargo.lock` and must never get one — the root `Cargo.lock` is the only lock (check-rename-clean.sh verifies the pins).
 - When changing rubash, update the root lockfile and verify niubash through the root package.
 - Never run destructive git operations against the rubash working tree. If the rubash checkout shows any uncommitted changes (modified, staged, or untracked files), treat it as someone else's in-progress work. Prohibited commands include git stash, git stash push, git reset, git checkout that discards edits, git restore, git clean, and any checkout or switch that would hide local edits. When rubash's local state blocks your build or verification, stop and report the blocker to the user. Do not stash, reset, restore, clean, or rewind the rubash tree to make it compile.
 

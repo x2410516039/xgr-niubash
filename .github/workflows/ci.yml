@@ -3,12 +3,16 @@ name: Niubash CI
 on:
   push:
     branches:
-      - master
-      - "rewrite/**"
+      - "**"
   pull_request:
     branches:
       - master
       - "rewrite/**"
+  # Weekly early-warning run against rubash master: the pin in Cargo.lock is
+  # what releases build, so this job only reports upstream breakage, it never
+  # commits a new pin.
+  schedule:
+    - cron: "0 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,28 +21,45 @@ env:
 jobs:
   build-and-test:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "locked" builds the committed Cargo.lock — the same inputs release
+        # builds and `cargo build --locked` see. "rubash-master" additionally
+        # floats the rubash dependency to upstream master.
+        rubash: [locked, rubash-master]
     steps:
       - uses: actions/checkout@v4.2.2
 
-      - name: Checkout rubash path dependency
+      - name: Checkout rubash (git dependency checkout for build.rs revision)
         run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/unixwin/rubash.git ../rubash
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1.11
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Update rubash to latest master
+        if: matrix.rubash == 'rubash-master'
         run: cargo update -p rubash
 
-      - name: cargo fmt --check (root package)
-        run: cargo fmt --check -p niubash
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.7.8
+        with:
+          key: ${{ matrix.rubash }}
+
+      - name: cargo fmt --check (workspace)
+        run: cargo fmt --check --all
+
+      # Advisory for now: the codebase carries ~90 pre-existing style-lint
+      # warnings. Tighten to `-- -D warnings` once the backlog is worked off;
+      # new code should not add to it.
+      - name: cargo clippy (workspace, advisory)
+        run: cargo clippy --workspace --locked --all-targets
 
       - name: cargo build
         run: cargo build --locked
 
       - name: cargo test (workspace)
         run: cargo test --workspace --locked
-
-
