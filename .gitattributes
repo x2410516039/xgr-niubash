@@ -1,0 +1,5 @@
+# Shell scripts are executed by Git Bash / winuxsh, both of which treat CR
+# as payload: a CRLF checkout breaks heredocs, array literals, and the
+# rename gate (`if\r: command not found`). Force LF so Windows checkouts
+# behave like the store.
+*.sh text eol=lf

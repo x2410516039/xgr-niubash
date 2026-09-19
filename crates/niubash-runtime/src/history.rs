@@ -105,8 +105,9 @@ impl RubashHistoryProvider {
     /// not stop a one-shot command that does not care about history.
     fn opened(&mut self) -> io::Result<&mut LiveFileBackedHistory> {
         if self.inner.is_none() {
-            let inner = LiveFileBackedHistory::with_mode(self.capacity, self.path.clone(), self.mode)
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            let inner =
+                LiveFileBackedHistory::with_mode(self.capacity, self.path.clone(), self.mode)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
             self.inner = Some(inner);
         }
         Ok(self.inner.as_mut().expect("provider opened above"))

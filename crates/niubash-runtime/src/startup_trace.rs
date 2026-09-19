@@ -47,7 +47,9 @@ pub fn tick(label: &str) {
     let _ = writeln!(
         std::io::stderr(),
         "NIU_TRACE_STARTUP: {:>8.1} ms  (delta {:>8})  {}",
-        total, delta, label
+        total,
+        delta,
+        label
     );
     LAST.with(|last| last.set(Some(now)));
 }
