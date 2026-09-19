@@ -153,6 +153,7 @@ fn run(args: &[String], cwd_state: &CwdStateOption) -> anyhow::Result<()> {
             niubash_runtime::startup_trace::tick("-c: Shell::new");
             shell.executor.inherit_process_stdin();
             shell.enable_process_stdin_pipeline_bridge();
+            shell.source_non_interactive_env();
             shell.executor.set_env("BASH_EXECUTION_STRING", &args[2]);
             if let Some(command_name) = args.get(3) {
                 shell.set_script_name(command_name);
@@ -218,8 +219,9 @@ fn run_shell_invocation(args: &[String], cwd_state: &CwdStateOption) -> anyhow::
     let mut shell = if invocation.read_stdin {
         niubash_runtime::Shell::new_for_stdin_script()?
     } else if invocation.command.is_some() {
-        // Single-command non-interactive invocation: skip REPL-only
-        // initialization (prompt, history, completion, aliases).
+        // Single-command non-interactive invocation. One-shot skips REPL-only
+        // initialization (prompt backend, completion state); managed aliases
+        // and the history provider stay, both pinned by contract tests.
         niubash_runtime::Shell::new_one_shot()?
     } else {
         niubash_runtime::Shell::new()?
