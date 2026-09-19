@@ -134,6 +134,17 @@ pub struct Shell {
     plugin_prompt_sync: PluginPromptSyncConfig,
     process_stdin_pipeline_bridge: bool,
     bash_prompt_command_running: bool,
+    // Executor PATH string the process PATH was last synced from. A match
+    // lets the per-command resync skip the env snapshot and rebuild.
+    synced_executor_path: Option<String>,
+    // Normalized executor PWD the process cwd was last synced into. Only the
+    // cwd sync itself (and process startup) change the process directory, so
+    // an unchanged PWD means the sync is already done.
+    synced_pwd: Option<String>,
+    // Memoized answer to `uses_primary_startup_rc`. The rc inputs never change
+    // mid-session, and every hook dispatcher re-asks per prompt; without the
+    // memo each prompt pays 1-2 home-directory stats.
+    primary_rc: Option<bool>,
     // True once this shell enters the interactive REPL. Easter eggs are
     // routed only from here so `niu -c`, script files, and piped stdin stay
     // quiet and deterministic.
@@ -556,6 +567,9 @@ impl Shell {
             plugin_prompt_sync,
             process_stdin_pipeline_bridge: false,
             bash_prompt_command_running: false,
+            synced_executor_path: None,
+            synced_pwd: None,
+            primary_rc: None,
             interactive: false,
             no_rc: false,
             no_profile: false,
@@ -665,12 +679,16 @@ impl Shell {
         Ok(code)
     }
 
+    // Parsed once per process: this runs before every script execution, and
+    // each hook/framework/PROMPT_COMMAND dispatch goes through it too.
     fn disable_rubash_history_storage(&mut self) {
+        static UNSET_HISTFILE_AST: std::sync::OnceLock<rubash::parser::Ast> =
+            std::sync::OnceLock::new();
         let previous_exit_code = self.executor.last_exit_code();
         self.executor.set_shell_option("history", false);
         self.executor.unset_env("HISTFILE");
-        let ast = parse(&tokenize("unset HISTFILE"));
-        let _ = self.executor.execute_ast(&ast);
+        let ast = UNSET_HISTFILE_AST.get_or_init(|| parse(&tokenize("unset HISTFILE")));
+        let _ = self.executor.execute_ast(ast);
         self.executor.set_shell_option("history", false);
         self.executor.unset_env("HISTFILE");
         self.executor.set_last_exit_code(previous_exit_code);
@@ -1045,10 +1063,20 @@ impl Shell {
         None
     }
 
-    fn uses_primary_startup_rc(&self) -> bool {
-        self.startup_rc_path().as_ref().is_some_and(|path| {
+    /// Whether the primary `~/.niubashrc` is the startup rc in effect.
+    ///
+    /// Memoized: the answer depends only on `rc_file`/`no_rc` and the home
+    /// directory, none of which change mid-session, and every hook dispatcher
+    /// re-asks on each prompt.
+    fn uses_primary_startup_rc(&mut self) -> bool {
+        if let Some(known) = self.primary_rc {
+            return known;
+        }
+        let known = self.startup_rc_path().as_ref().is_some_and(|path| {
             path.file_name().and_then(|name| name.to_str()) == Some(NIU_RC_FILE)
-        })
+        });
+        self.primary_rc = Some(known);
+        known
     }
 
     /// Whether the oh-my-niu framework runner is actually defined in this
@@ -2539,6 +2567,11 @@ impl Shell {
 
     /// Update the shared completion state from the current env + cwd.
     pub fn update_completion_state(&self) {
+        // One-shot shells have no REPL that reads completion state; the full
+        // env clone + function snapshot would be pure startup overhead.
+        if self.one_shot {
+            return;
+        }
         if let Ok(mut state) = self.completion_state.lock() {
             state.current_dir = self
                 .executor_pwd_host_path()
@@ -2597,12 +2630,20 @@ impl Shell {
         let Some(path) = self.executor.get_env("PATH") else {
             return;
         };
+        // The rebuild below snapshots the whole executor env and re-translates
+        // every PATH entry; per command that is the dominant avoidable cost.
+        // The translation is a pure function of the executor PATH, so an
+        // unchanged value means the process PATH is already in sync.
+        if self.synced_executor_path.as_deref() == Some(path) {
+            return;
+        }
         let env = self.executor.env_vars_snapshot();
         let process_path = process_path_from_shell_path_list(path, Some(&env));
         std::env::set_var("PATH", &process_path);
         if cfg!(windows) && process_path != path {
             self.executor.set_env("PATH", &process_path);
         }
+        self.synced_executor_path = Some(process_path);
     }
 
     fn sync_process_cwd_from_executor_pwd(&mut self) {
@@ -2618,6 +2659,11 @@ impl Shell {
                 return;
             }
         };
+        // Nothing but this sync moves the process cwd, so an unchanged PWD
+        // means the stat + set_current_dir pair below already ran for it.
+        if self.synced_pwd.as_deref() == Some(pwd.as_str()) {
+            return;
+        }
         let host_pwd = self.executor.resolve_shell_path(&pwd);
         let target = host_pwd.clone();
         if !target.is_dir() {
@@ -2643,6 +2689,7 @@ impl Shell {
             self.shell_root.as_deref(),
         );
         self.executor.set_env("PWD", &normalized_pwd);
+        self.synced_pwd = Some(normalized_pwd.clone());
         if let Some(old_pwd) = self.executor.get_env("OLDPWD").map(str::to_owned) {
             let normalized_old_pwd = normalize_shell_visible_path(&old_pwd);
             if normalized_old_pwd != old_pwd {
@@ -3390,11 +3437,57 @@ fn execute_niubash_host_external_command(
         return None;
     };
 
-    if resolve_native_command_path_with_env(command, env).is_some() {
+    if cached_native_command_path(command, env).is_some() {
         return None;
     }
 
     command_not_found_host_external_output(command, args, env, plugins)
+}
+
+/// Cache of native-command PATH lookups for the host external-command
+/// handler.
+///
+/// rubash calls the handler before every external spawn with a fresh env
+/// snapshot, and the resolution stats up to four extensions across every
+/// PATH directory. The result is a pure function of the translated process
+/// PATH, so the cache keys all entries on that string and rebuilds whenever
+/// the executor's PATH changes. Commands that name a path themselves resolve
+/// against the caller's cwd and bypass the cache.
+struct NativeCommandPathCache {
+    path_key: String,
+    entries: HashMap<String, Option<PathBuf>>,
+}
+
+static NATIVE_COMMAND_PATH_CACHE: std::sync::OnceLock<std::sync::Mutex<NativeCommandPathCache>> =
+    std::sync::OnceLock::new();
+
+fn cached_native_command_path(command: &str, env: &HashMap<String, String>) -> Option<PathBuf> {
+    if command.contains('/') || command.contains('\\') {
+        return resolve_native_command_path_with_env(command, env);
+    }
+    let Some(path) = env.get("PATH") else {
+        return resolve_native_command_path_with_env(command, env);
+    };
+    let path = path.clone();
+    let cache = NATIVE_COMMAND_PATH_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(NativeCommandPathCache {
+            path_key: String::new(),
+            entries: HashMap::new(),
+        })
+    });
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.path_key != path {
+        cache.path_key = path;
+        cache.entries.clear();
+    }
+    if let Some(resolved) = cache.entries.get(command) {
+        return resolved.clone();
+    }
+    let resolved = resolve_native_command_path_with_env(command, env);
+    cache.entries.insert(command.to_string(), resolved.clone());
+    resolved
 }
 
 fn command_not_found_host_external_output(
@@ -8271,6 +8364,9 @@ niubash_prompt_use_template "PLUGIN:{git}{prompt_char} " ""
             plugin_prompt_sync: PluginPromptSyncConfig::disabled(),
             process_stdin_pipeline_bridge: false,
             bash_prompt_command_running: false,
+            synced_executor_path: None,
+            synced_pwd: None,
+            primary_rc: None,
             interactive: false,
             no_rc: false,
             no_profile: false,

@@ -5,6 +5,7 @@
 //! selectable official themes.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use nu_ansi_term::{Color, Style};
 use serde::{Deserialize, Serialize};
@@ -100,6 +101,56 @@ fn user_theme_dir() -> Option<PathBuf> {
     crate::path_utils::shell_home_dir().map(|home| home.join(".niubash").join("themes"))
 }
 
+/// Parse cache for user theme files, keyed by theme name.
+///
+/// `by_name` runs per prompt render on hot paths (segment colours, prompt
+/// sync); without the cache every call paid a read + TOML parse. Entries are
+/// validated against the file mtime, so an edited theme reloads on the next
+/// lookup.
+struct UserThemeCacheEntry {
+    mtime: Option<SystemTime>,
+    theme: Theme,
+}
+
+static USER_THEME_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, UserThemeCacheEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn load_user_theme_from_dir(name: &str, theme_dir: &Path) -> Option<Theme> {
+    if !is_safe_theme_name(name) {
+        log::warn!("Ignoring unsafe theme name '{}'", name);
+        return None;
+    }
+
+    let path = theme_dir.join(format!("{}.toml", name));
+    if !path.is_file() {
+        return None;
+    }
+
+    let mtime = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok();
+    if let Ok(cache) = USER_THEME_CACHE.lock() {
+        if let Some(entry) = cache.get(name) {
+            if entry.mtime == mtime {
+                return Some(entry.theme.clone());
+            }
+        }
+    }
+
+    let theme = load_theme_from_file(name, &path)?;
+    if let Ok(mut cache) = USER_THEME_CACHE.lock() {
+        cache.insert(
+            name.to_string(),
+            UserThemeCacheEntry {
+                mtime,
+                theme: theme.clone(),
+            },
+        );
+    }
+    Some(theme)
+}
+
 pub fn user_theme_entries() -> Vec<UserThemeEntry> {
     user_theme_dir()
         .map(|theme_dir| user_theme_entries_from_dir(&theme_dir))
@@ -124,20 +175,6 @@ fn user_theme_entries_from_dir(theme_dir: &Path) -> Vec<UserThemeEntry> {
         .collect::<Vec<_>>();
     themes.sort_by(|a, b| a.name.cmp(&b.name));
     themes
-}
-
-fn load_user_theme_from_dir(name: &str, theme_dir: &Path) -> Option<Theme> {
-    if !is_safe_theme_name(name) {
-        log::warn!("Ignoring unsafe theme name '{}'", name);
-        return None;
-    }
-
-    let path = theme_dir.join(format!("{}.toml", name));
-    if !path.is_file() {
-        return None;
-    }
-
-    load_theme_from_file(name, &path)
 }
 
 pub(crate) fn load_theme_from_file(name: &str, path: &Path) -> Option<Theme> {

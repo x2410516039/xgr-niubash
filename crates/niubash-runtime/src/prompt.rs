@@ -56,6 +56,25 @@ pub struct NiubashPrompt {
     indicators: PromptIndicators,
     prompt_symbol: String,
     theme: Theme,
+    /// Memoized `render_template` output. reedline re-invokes every prompt
+    /// render hook on each keystroke (4+ renders per keystroke); the render
+    /// is a pure function of the template inputs, the process cwd, the
+    /// status/duration env tokens, the git snapshot epoch, and the wall-clock
+    /// minute, so an unchanged key returns the previous rendering. `{user}` /
+    /// `{host}` env changes are not tracked: they never change mid-session
+    /// in practice.
+    render_cache: std::cell::RefCell<Option<(RenderCacheKey, String)>>,
+}
+
+/// Inputs `render_template`'s output can depend on.
+#[derive(Clone, PartialEq, Eq)]
+struct RenderCacheKey {
+    template: String,
+    status_token: Option<String>,
+    cwd: Option<PathBuf>,
+    minute: u32,
+    command_execution_time: String,
+    git_epoch: u64,
 }
 
 /// Theme/plugin-owned text around a host-provided Git status snapshot.
@@ -136,23 +155,28 @@ impl NiubashPrompt {
             git_prompt_symbols: symbols,
             prompt_symbol,
             theme: by_name(theme_name),
+            render_cache: std::cell::RefCell::new(None),
         }
     }
 
     pub fn set_git_prompt_snapshot(&mut self, snapshot: Option<String>) {
         self.git_prompt_snapshot = snapshot;
+        self.render_cache = std::cell::RefCell::new(None);
     }
 
     pub fn set_git_status_snapshot(&mut self, snapshot: Option<GitRepoStatus>) {
         self.git_status_snapshot = snapshot;
+        self.render_cache = std::cell::RefCell::new(None);
     }
 
     pub fn set_git_prompt_decor(&mut self, decor: GitPromptDecor) {
         self.git_prompt_decor = decor;
+        self.render_cache = std::cell::RefCell::new(None);
     }
 
     pub fn set_theme(&mut self, theme_name: &str) {
         self.theme = by_name(theme_name);
+        self.render_cache = std::cell::RefCell::new(None);
     }
 
     fn paint_git_status_detail(&self, compact: &str, dirty: bool) -> String {
@@ -215,19 +239,52 @@ impl NiubashPrompt {
     }
 
     fn render_template(&self, template: &str, status_token: Option<&str>) -> String {
+        let cwd_path = std::env::current_dir().ok();
+        let command_execution_time = std::env::var("NIU_LAST_COMMAND_DURATION")
+            .or_else(|_| std::env::var("NIU_CMD_EXEC_TIME_MS"))
+            .unwrap_or_default();
+        let key = RenderCacheKey {
+            template: template.to_string(),
+            status_token: status_token.map(str::to_string),
+            cwd: cwd_path.clone(),
+            minute: local_hour_minute().0,
+            command_execution_time: command_execution_time.clone(),
+            git_epoch: crate::git_status::snapshot_epoch(),
+        };
+        if let Ok(cache) = self.render_cache.try_borrow() {
+            if let Some((cached_key, cached_render)) = cache.as_ref() {
+                if *cached_key == key {
+                    return cached_render.clone();
+                }
+            }
+        }
+        let rendered = self.render_template_uncached(
+            template,
+            status_token,
+            cwd_path.as_deref(),
+            &command_execution_time,
+        );
+        if let Ok(mut cache) = self.render_cache.try_borrow_mut() {
+            *cache = Some((key, rendered.clone()));
+        }
+        rendered
+    }
+
+    fn render_template_uncached(
+        &self,
+        template: &str,
+        status_token: Option<&str>,
+        cwd_path: Option<&Path>,
+        command_execution_time: &str,
+    ) -> String {
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "?".to_string());
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| "winhost".to_string());
-        let cwd_path = std::env::current_dir().ok();
-        let cwd = cwd_path
-            .as_deref()
-            .map(display_cwd)
-            .unwrap_or_else(|| "?".to_string());
+        let cwd = cwd_path.map(display_cwd).unwrap_or_else(|| "?".to_string());
         let cwd_base = cwd_path
-            .as_deref()
             .and_then(display_cwd_base)
             .unwrap_or_else(|| cwd.clone());
 
@@ -245,9 +302,7 @@ impl NiubashPrompt {
         let git_status: Option<GitRepoStatus> = if needs_git {
             self.git_status_snapshot.clone().or_else(|| {
                 if self.git_prompt_snapshot.is_none() {
-                    cwd_path
-                        .as_deref()
-                        .and_then(crate::git_status::collect_for_prompt)
+                    cwd_path.and_then(crate::git_status::collect_for_prompt)
                 } else {
                     None
                 }
@@ -297,9 +352,6 @@ impl NiubashPrompt {
 
         let time_str = format_local_time();
         let time_str_24 = time_str.clone();
-        let command_execution_time = std::env::var("NIU_LAST_COMMAND_DURATION")
-            .or_else(|_| std::env::var("NIU_CMD_EXEC_TIME_MS"))
-            .unwrap_or_default();
 
         let mut rendered = template
             .replace("{time}", &time_str)

@@ -208,6 +208,7 @@ pub fn trust_bundle(name: &str) -> anyhow::Result<ExternalBundleRecord> {
     record.trusted = true;
     let trusted = record.clone();
     write_registry(&registry)?;
+    super::invalidate_plugin_inventory_cache();
     Ok(trusted)
 }
 
@@ -230,6 +231,7 @@ pub fn remove_bundle(name: &str) -> anyhow::Result<PathBuf> {
         fs::remove_dir_all(&record.path)
             .with_context(|| format!("failed to remove {}", record.path.display()))?;
     }
+    super::invalidate_plugin_inventory_cache();
     Ok(record.path)
 }
 

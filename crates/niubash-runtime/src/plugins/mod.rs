@@ -601,11 +601,65 @@ pub fn effective_plugin_state(config: &PluginConfig) -> PluginRuntimeState {
     state
 }
 pub fn active_plugin_inventory() -> PluginInventory {
-    active_plugin_inventory_result().unwrap_or_else(|err| {
-        log::warn!("falling back to compiled plugin inventory: {}", err);
-        compiled_plugin_inventory()
+    active_plugin_inventory_cached().unwrap_or_else(|| {
+        active_plugin_inventory_result().unwrap_or_else(|err| {
+            log::warn!("falling back to compiled plugin inventory: {}", err);
+            compiled_plugin_inventory()
+        })
     })
 }
+
+/// Process-wide cache for the resolved plugin inventory.
+///
+/// The inventory is consulted per command, per hook dispatch, and several
+/// times at startup; without the cache every call re-read and re-parsed the
+/// plugin lock and bundle manifest from disk. Entries are validated against
+/// the env override value and the lock file stamp, so activating, updating,
+/// or removing a bundle takes effect on the next lookup — the management
+/// entry points also invalidate explicitly.
+struct InventoryCacheEntry {
+    env_override: Option<String>,
+    lock_stamp: Option<(SystemTime, u64)>,
+    inventory: PluginInventory,
+}
+
+static INVENTORY_CACHE: std::sync::LazyLock<std::sync::Mutex<Option<InventoryCacheEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Drop the memoized inventory so the next lookup re-resolves from disk.
+pub fn invalidate_plugin_inventory_cache() {
+    if let Ok(mut cache) = INVENTORY_CACHE.lock() {
+        *cache = None;
+    }
+}
+
+fn plugin_lock_stamp(lock_path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(lock_path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn active_plugin_inventory_cached() -> Option<PluginInventory> {
+    let env_override =
+        env_path("NIU_PLUGIN_BUNDLE_PATH").map(|path| path.to_string_lossy().into_owned());
+    let lock_stamp = plugin_lock_stamp(&plugin_lock_path());
+    if let Ok(cache) = INVENTORY_CACHE.lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.env_override == env_override && entry.lock_stamp == lock_stamp {
+                return Some(entry.inventory.clone());
+            }
+        }
+    }
+    let inventory = active_plugin_inventory_result().ok()?;
+    if let Ok(mut cache) = INVENTORY_CACHE.lock() {
+        *cache = Some(InventoryCacheEntry {
+            env_override,
+            lock_stamp,
+            inventory: inventory.clone(),
+        });
+    }
+    Some(inventory)
+}
+
 fn active_plugin_inventory_result() -> anyhow::Result<PluginInventory> {
     if let Some(path) = env_path("NIU_PLUGIN_BUNDLE_PATH") {
         if path.exists() {
@@ -3519,6 +3573,7 @@ fn read_plugin_lock(path: &Path) -> anyhow::Result<PluginLockToml> {
 fn write_plugin_lock(path: &Path, lock: &PluginLockToml) -> anyhow::Result<()> {
     let text = toml::to_string_pretty(lock)?;
     fs::write(path, text)?;
+    invalidate_plugin_inventory_cache();
     Ok(())
 }
 fn file_sha256(path: &Path) -> anyhow::Result<String> {
