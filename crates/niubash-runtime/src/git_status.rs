@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -214,7 +214,16 @@ fn collect_uncached(cwd: &Path) -> Option<GitRepoStatus> {
     if !is_likely_git_repo(cwd) {
         return None;
     }
-    let status_output = run_git(&["status", "--porcelain", "-b"], cwd, GIT_TIMEOUT, 4 * 1024)?;
+    // Porcelain lines run ~30-60 bytes, so a 4 KB cap silently dropped the
+    // git segment for repos with ~100 changed files. 1 MB covers ~20k files
+    // while still bounding worker memory.
+    const GIT_STATUS_MAX_STDOUT: usize = 1024 * 1024;
+    let status_output = run_git(
+        &["status", "--porcelain", "-b"],
+        cwd,
+        GIT_TIMEOUT,
+        GIT_STATUS_MAX_STDOUT,
+    )?;
     let status_stdout = String::from_utf8(status_output.stdout).ok()?;
     let mut lines = status_stdout.lines();
     let branch_line = lines.next()?;
@@ -313,6 +322,20 @@ pub fn collect_for_prompt(cwd: &Path) -> Option<GitRepoStatus> {
     snapshot_for_prompt(cwd).into_status()
 }
 
+/// Monotonic tick bumped whenever the snapshot landscape changes (a status
+/// lands, a refresh is requested, or the cache clears). Prompt render caches
+/// include it in their key so a finished background refresh invalidates a
+/// cached rendering without any extra locking on the UI thread.
+static SNAPSHOT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn snapshot_epoch() -> u64 {
+    SNAPSHOT_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn bump_snapshot_epoch() {
+    SNAPSHOT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Mark one cwd as likely changed and schedule a refresh. The current prompt
 /// keeps using the previous stable snapshot until the worker publishes a new
 /// one.
@@ -344,6 +367,7 @@ pub fn clear_cache() {
     state.latest_requested.clear();
     state.next_generation = state.next_generation.saturating_add(1);
     state.clear_generation = state.next_generation;
+    bump_snapshot_epoch();
 }
 
 fn store_snapshot(cwd: PathBuf, status: Option<GitRepoStatus>, dirty: bool) {
@@ -358,6 +382,7 @@ fn store_snapshot(cwd: PathBuf, status: Option<GitRepoStatus>, dirty: bool) {
             dirty,
         },
     );
+    bump_snapshot_epoch();
 }
 
 fn enqueue_refresh_locked(
@@ -436,6 +461,7 @@ fn start_worker(service: Arc<GitStatusService>) {
                         dirty: needs_rerun,
                     },
                 );
+                bump_snapshot_epoch();
                 if needs_rerun && !state.pending.contains(&request.cwd) {
                     state.pending.insert(request.cwd.clone());
                     state.queue.push_back(GitStatusRequest {
@@ -463,9 +489,15 @@ struct GitStatusDaemonResponse {
 struct GitStatusDaemonClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: std::sync::mpsc::Receiver<GitStatusDaemonResponse>,
     next_id: u64,
 }
+
+/// Bound on one daemon round-trip. The daemon itself enforces GIT_TIMEOUT
+/// per git call and chains several of them per status, so the bound has to
+/// exceed that worst case while still unblocking the worker from a hung
+/// daemon.
+const DAEMON_ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl GitStatusDaemonClient {
     fn spawn() -> Option<Self> {
@@ -483,10 +515,36 @@ impl GitStatusDaemonClient {
             .ok()?;
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
+        // A dedicated reader keeps the worker free of an unbounded blocking
+        // read: a stalled daemon now trips the round-trip timeout instead of
+        // freezing every future status update. When the client is dropped
+        // the child is killed, the pipe closes, and this thread exits.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("niubash-gitstatus-reader".to_string())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => match serde_json::from_str::<GitStatusDaemonResponse>(&line) {
+                            Ok(response) => {
+                                if tx.send(response).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        },
+                    }
+                }
+            })
+            .ok()?;
         Some(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            responses: rx,
             next_id: 0,
         })
     }
@@ -501,12 +559,15 @@ impl GitStatusDaemonClient {
         self.stdin.write_all(b"\n").ok()?;
         self.stdin.flush().ok()?;
 
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line).ok()? == 0 {
-            return None;
+        // A timed-out request leaves a stale response in the channel; id
+        // matching skips it when the daemon eventually answers.
+        loop {
+            match self.responses.recv_timeout(DAEMON_ROUND_TRIP_TIMEOUT) {
+                Ok(response) if response.id == request.id => return Some(response.status),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
         }
-        let response: GitStatusDaemonResponse = serde_json::from_str(&line).ok()?;
-        (response.id == request.id).then_some(response.status)
     }
 }
 
@@ -560,27 +621,40 @@ fn is_likely_git_repo(mut dir: &Path) -> bool {
     }
 }
 
+/// Poll interval while waiting on a bounded `git` child. The wait runs on
+/// the gitstatus worker thread (or the daemon process), never on the UI
+/// thread, so the extra syscalls cost nothing the user can feel.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
 fn run_git(args: &[&str], cwd: &Path, timeout: Duration, max_stdout: usize) -> Option<Output> {
-    let cwd = cwd.to_owned();
-    let args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _handle = std::thread::spawn(move || {
-        let result = Command::new("git")
-            .args(&args)
-            .current_dir(&cwd)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let _ = tx.send(result);
-    });
-    let output = match rx.recv_timeout(timeout) {
-        Ok(Ok(o)) => o,
-        _ => return None, // timed out, git hung, or sender dropped
-    };
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                // The previous channel+thread design leaked both the git
+                // child and the waiting thread on every timeout (huge repo,
+                // locked index, network FS), one per refresh cycle.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(GIT_POLL_INTERVAL),
+            Err(_) => return None,
+        }
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() || output.stdout.len() > max_stdout {
         None
     } else {
