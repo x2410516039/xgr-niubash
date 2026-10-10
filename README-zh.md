@@ -6,6 +6,12 @@
 > 不用 WSL，不开虚拟机，没有 `/mnt/c`，没有 cmdlet 方言。
 > 一个 `niu.exe`：你手指肌肉记得的那个 shell，也是你 AI agent 天生会说的那个 shell。
 
+> **声明**
+> 本仓库是 [unixwin/niubash](https://github.com/unixwin/niubash) 的**修改版**。
+> 原作者为 **unixwin**，上游项目以 [MIT License](https://github.com/unixwin/niubash/blob/main/LICENSE) 发布。
+> 本仓库的改动（更名为 `xgr-niubash` 及本地修改）由 `x2410516039` 完成，
+> **不代表**原作者立场，也与原作者无关。
+
 <div align="center">
 
 [English](README.md) · [中文](README-zh.md)
