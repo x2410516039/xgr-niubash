@@ -6,6 +6,13 @@
 > One `niu.exe`: the shell your fingers already know — and the one your AI
 > agent actually speaks.
 
+> **Attribution notice**
+> This repository is a **modified fork** of [unixwin/niubash](https://github.com/unixwin/niubash).
+> The original author is **unixwin**, and the upstream project is released under the
+> [MIT License](https://github.com/unixwin/niubash/blob/main/LICENSE).
+> Changes here (renamed to `xgr-niubash`, plus local edits) were made by
+> `x2410516039` and are **not** endorsed by or affiliated with the original author.
+
 <div align="center">
 
 [English](README.md) · [中文](README-zh.md)
